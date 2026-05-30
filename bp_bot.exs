@@ -1,158 +1,388 @@
-Mix.install([{:req, "~> 0.5"}, {:jose, "~> 1.11"}, {:jason, "~> 1.4"}])
+Mix.install([{:req, "~> 0.5"}, {:jason, "~> 1.4"}])
 
 # =============================================================================
 # 血壓追蹤 Telegram 機器人 (Blood Pressure Tracking Telegram Bot)
 # =============================================================================
 #
-# 單檔 Elixir 腳本，使用 Telegram 長輪詢 (long polling) 與 Google Sheets v4 API
-# (服務帳號 OAuth2 JWT) 作為後端儲存。繁體中文 (台灣) 內嵌鍵盤介面。
+# 單檔 Elixir 腳本。每位使用者透過 Telegram 以「Google 帳號授權 (OAuth2)」
+# 連結自己的 Google Drive，機器人會在「使用者自己的雲端硬碟」建立一份私人
+# 試算表來記錄血壓。繁體中文 (台灣) 內嵌鍵盤介面。
+#
+# -----------------------------------------------------------------------------
+# 為什麼是 OAuth 而非服務帳號 (Service Account)？
+# -----------------------------------------------------------------------------
+#   服務帳號只能存取「它自己的」雲端硬碟，無法寫入任意使用者的私人 Drive。
+#   要讓每位使用者把資料存在「自己的」Drive，必須使用 OAuth 使用者授權流程
+#   (每位使用者各自同意，並各自取得 refresh token)。
 #
 # -----------------------------------------------------------------------------
 # 必要的環境變數 (Required environment variables):
 # -----------------------------------------------------------------------------
-#   TELEGRAM_BOT_TOKEN  - 從 @BotFather 取得的 Telegram bot token
-#   GOOGLE_SHEET_ID     - Google 試算表的 spreadsheetId (網址中 /d/<這段>/edit)
-#   GOOGLE_SA_KEY_FILE  - Google 服務帳號 JSON 金鑰檔案的絕對路徑
+#   TELEGRAM_BOT_TOKEN       - 從 @BotFather 取得的 Telegram bot token
+#   GOOGLE_OAUTH_CLIENT_FILE - OAuth 用戶端 JSON 金鑰檔路徑 (含 client_id /
+#                              client_secret)。請建立「桌面應用程式 (Desktop
+#                              app)」類型的 OAuth 用戶端。
 #
 # -----------------------------------------------------------------------------
-# 如何建立服務帳號並分享試算表 (Setup):
+# 設定 Google OAuth (一次性):
 # -----------------------------------------------------------------------------
-#   1. 前往 Google Cloud Console -> 建立專案 -> 啟用「Google Sheets API」。
-#   2. 建立「服務帳號 (Service Account)」，並產生 JSON 金鑰，下載存檔。
-#      金鑰檔內含 client_email / private_key / token_uri 等欄位。
-#   3. 開啟你的 Google 試算表，點「共用」，把該服務帳號的 client_email
-#      (形如 xxx@yyy.iam.gserviceaccount.com) 加為「編輯者」。
-#   4. 試算表第一列(標題列)請預先填入 6 欄:
-#        日期時間 | 收縮壓 | 舒張壓 | 脈搏 | Telegram使用者 | 備註
-#   5. 若你的工作表(分頁)名稱不是 "Sheet1"，請修改下方 @sheet_name 常數。
+#   1. Google Cloud Console -> 建立專案 -> 啟用「Google Drive API」與
+#      「Google Sheets API」。
+#   2. 「OAuth 同意畫面」: 使用者類型選「外部」，填寫基本資訊；在「測試使用者」
+#      區段加入會使用此機器人的 Google 帳號 (測試模式最多 100 位，免 Google
+#      應用程式審查)。範圍 (scope) 使用 drive.file 即可，屬非敏感範圍。
+#   3. 「憑證 -> 建立憑證 -> OAuth 用戶端 ID」-> 應用程式類型選「桌面應用程式」。
+#      下載 JSON (內含 client_id / client_secret)，設為 GOOGLE_OAUTH_CLIENT_FILE。
+#   4. 重要 (loopback 限制): 重新導向採用 http://localhost:#{53682}/ (見下方
+#      @redirect_port)。授權者的瀏覽器必須與「機器人執行的主機」為同一台，
+#      Google 才會把授權碼送回機器人。適合自用 / 同機使用者。
 #
 # -----------------------------------------------------------------------------
 # 執行方式 (How to run):
 # -----------------------------------------------------------------------------
 #   export TELEGRAM_BOT_TOKEN=...
-#   export GOOGLE_SHEET_ID=...
-#   export GOOGLE_SA_KEY_FILE=/path/to/service_account.json
+#   export GOOGLE_OAUTH_CLIENT_FILE=/path/to/oauth_client.json
 #   elixir bp_bot.exs
+#
+#   使用者資料 (refresh token、試算表 ID) 會存於工作目錄的 users.json，
+#   內含機密，請勿提交版控或外流。
 # =============================================================================
 
 require Logger
 
 defmodule Bot.Config do
-  @moduledoc "讀取環境變數與服務帳號 JSON 金鑰。無可變狀態。"
+  @moduledoc "讀取環境變數與 OAuth 用戶端設定。"
+
+  # loopback 重新導向所用的固定埠號。
+  @redirect_port 53682
 
   def token, do: System.fetch_env!("TELEGRAM_BOT_TOKEN")
 
-  def sheet_id, do: System.fetch_env!("GOOGLE_SHEET_ID")
+  def redirect_uri, do: "http://localhost:#{@redirect_port}/"
 
-  def service_account do
-    System.fetch_env!("GOOGLE_SA_KEY_FILE")
-    |> File.read!()
-    |> Jason.decode!()
-    |> then(fn json ->
-      %{
-        client_email: json["client_email"],
-        private_key: json["private_key"],
-        token_uri: json["token_uri"] || "https://oauth2.googleapis.com/token"
-      }
-    end)
+  def redirect_port, do: @redirect_port
+
+  # OAuth 用戶端 JSON 可能是 {"installed": {...}} 或 {"web": {...}}。
+  def oauth_client do
+    json =
+      System.fetch_env!("GOOGLE_OAUTH_CLIENT_FILE")
+      |> File.read!()
+      |> Jason.decode!()
+
+    c = json["installed"] || json["web"] || json
+
+    %{
+      client_id: c["client_id"],
+      client_secret: c["client_secret"],
+      auth_uri: c["auth_uri"] || "https://accounts.google.com/o/oauth2/v2/auth",
+      token_uri: c["token_uri"] || "https://oauth2.googleapis.com/token"
+    }
   end
 
   def api_base, do: "https://api.telegram.org/bot" <> token()
 end
 
-defmodule Bot.Auth do
-  @moduledoc "鑄造並快取 Google OAuth2 access token (RS256 JWT via JOSE)。"
+defmodule Bot.Users do
+  @moduledoc """
+  每位使用者的持久化資料 (refresh_token、spreadsheet_id)，以 chat_id (字串)
+  為鍵，存於 users.json 並於每次更新時寫回檔案。
+  """
+
+  @store_file "users.json"
 
   def start_link do
-    Agent.start_link(fn -> %{token: nil, expires_at: 0} end, name: __MODULE__)
+    init =
+      case File.read(@store_file) do
+        {:ok, bin} -> Jason.decode!(bin)
+        _ -> %{}
+      end
+
+    Agent.start_link(fn -> init end, name: __MODULE__)
   end
 
-  def token do
-    cache = Agent.get(__MODULE__, & &1)
+  def get(chat_id), do: Agent.get(__MODULE__, &Map.get(&1, to_string(chat_id)))
 
-    if valid?(cache) do
-      cache.token
+  def put(chat_id, fields) do
+    key = to_string(chat_id)
+
+    Agent.update(__MODULE__, fn m ->
+      updated = Map.merge(Map.get(m, key, %{}), fields)
+      m = Map.put(m, key, updated)
+      File.write!(@store_file, Jason.encode!(m))
+      m
+    end)
+  end
+
+  def connected?(chat_id) do
+    case get(chat_id) do
+      %{"refresh_token" => rt} when is_binary(rt) -> true
+      _ -> false
+    end
+  end
+end
+
+defmodule Bot.OAuth do
+  @moduledoc """
+  OAuth 使用者授權流程：產生授權連結、以 loopback HTTP 伺服器接收 Google
+  重新導向的授權碼、交換 token、並快取各使用者的 access token。
+  """
+
+  require Logger
+
+  @scope "https://www.googleapis.com/auth/drive.file"
+
+  # state -> chat_id 的暫存對應；chat_id -> %{token, expires_at} 的 token 快取。
+  def start_link do
+    Agent.start_link(fn -> %{} end, name: Bot.OAuth.Pending)
+    Agent.start_link(fn -> %{} end, name: Bot.OAuth.Cache)
+    port = Bot.Config.redirect_port()
+
+    {:ok, listen} =
+      :gen_tcp.listen(port,
+        ip: {127, 0, 0, 1},
+        mode: :binary,
+        packet: :raw,
+        active: false,
+        reuseaddr: true
+      )
+
+    spawn_link(fn -> accept_loop(listen) end)
+    Logger.info("OAuth loopback 伺服器已啟動於 #{Bot.Config.redirect_uri()}")
+    :ok
+  end
+
+  # 產生授權連結，並記下 state -> chat_id 的對應。
+  def auth_url(chat_id) do
+    c = Bot.Config.oauth_client()
+    state = Base.url_encode64(:crypto.strong_rand_bytes(12), padding: false)
+    Agent.update(Bot.OAuth.Pending, &Map.put(&1, state, chat_id))
+
+    query =
+      URI.encode_query(%{
+        "client_id" => c.client_id,
+        "redirect_uri" => Bot.Config.redirect_uri(),
+        "response_type" => "code",
+        "scope" => @scope,
+        "access_type" => "offline",
+        "prompt" => "consent",
+        "state" => state
+      })
+
+    c.auth_uri <> "?" <> query
+  end
+
+  # 取得有效的 access token：先看記憶體快取，過期則用 refresh_token 換新的。
+  def access_token(chat_id) do
+    cache = Agent.get(Bot.OAuth.Cache, &Map.get(&1, chat_id))
+
+    if cache && cache.expires_at - System.os_time(:second) > 60 do
+      {:ok, cache.token}
     else
-      # 在 Agent 交易外進行網路請求，避免請求失敗時連帶讓 Agent 程序崩潰。
-      fresh = refresh()
-      Agent.update(__MODULE__, fn _ -> fresh end)
-      fresh.token
+      refresh(chat_id)
     end
   end
 
-  def valid?(cache) do
-    cache.token != nil and cache.expires_at - System.os_time(:second) > 60
+  defp refresh(chat_id) do
+    case Bot.Users.get(chat_id) do
+      %{"refresh_token" => rt} when is_binary(rt) ->
+        c = Bot.Config.oauth_client()
+
+        resp =
+          Req.post!(c.token_uri,
+            form: [
+              client_id: c.client_id,
+              client_secret: c.client_secret,
+              refresh_token: rt,
+              grant_type: "refresh_token"
+            ]
+          )
+
+        case resp do
+          %{status: 200, body: %{"access_token" => at, "expires_in" => ttl}} ->
+            cache_token(chat_id, at, ttl)
+            {:ok, at}
+
+          other ->
+            {:error, "更新 token 失敗: #{other.status} #{inspect(other.body)}"}
+        end
+
+      _ ->
+        {:error, :not_connected}
+    end
   end
 
-  def refresh do
-    sa = Bot.Config.service_account()
-    jwt = build_jwt(sa)
+  defp cache_token(chat_id, token, ttl) do
+    entry = %{token: token, expires_at: System.os_time(:second) + ttl}
+    Agent.update(Bot.OAuth.Cache, &Map.put(&1, chat_id, entry))
+  end
+
+  # ----- loopback HTTP 伺服器 -----
+
+  defp accept_loop(listen) do
+    case :gen_tcp.accept(listen) do
+      {:ok, sock} ->
+        spawn(fn -> handle_conn(sock) end)
+        accept_loop(listen)
+
+      {:error, reason} ->
+        Logger.error("OAuth accept 失敗: #{inspect(reason)}")
+        accept_loop(listen)
+    end
+  end
+
+  defp handle_conn(sock) do
+    params = read_query(sock)
+    respond(sock, "✅ 授權完成，請回到 Telegram 繼續使用。您可以關閉此分頁。")
+
+    state = params["state"]
+    chat_id = state && Agent.get_and_update(Bot.OAuth.Pending, &Map.pop(&1, state))
+
+    cond do
+      params["error"] ->
+        Logger.error("OAuth 使用者拒絕或錯誤: #{params["error"]}")
+
+      is_nil(chat_id) ->
+        Logger.error("OAuth callback 無對應的 state (可能已過期)")
+
+      params["code"] ->
+        finish_auth(chat_id, params["code"])
+
+      true ->
+        Logger.error("OAuth callback 缺少授權碼")
+    end
+  rescue
+    e -> Logger.error("OAuth callback 處理失敗: #{inspect(e)}")
+  end
+
+  defp finish_auth(chat_id, code) do
+    c = Bot.Config.oauth_client()
 
     resp =
-      Req.post!(sa.token_uri,
+      Req.post!(c.token_uri,
         form: [
-          grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
-          assertion: jwt
+          client_id: c.client_id,
+          client_secret: c.client_secret,
+          code: code,
+          redirect_uri: Bot.Config.redirect_uri(),
+          grant_type: "authorization_code"
         ]
       )
 
     case resp do
-      %{status: 200, body: %{"access_token" => tok, "expires_in" => ttl}} ->
-        %{token: tok, expires_at: System.os_time(:second) + ttl}
+      %{status: 200, body: %{"access_token" => at, "refresh_token" => rt, "expires_in" => ttl}} ->
+        Bot.Users.put(chat_id, %{"refresh_token" => rt})
+        cache_token(chat_id, at, ttl)
+        # 預先在使用者 Drive 建立試算表，確認流程可用。
+        Bot.Sheets.ensure_spreadsheet(chat_id)
+
+        Bot.Telegram.send_message(
+          chat_id,
+          "✅ Google 帳號連結成功！已在您的雲端硬碟建立「血壓紀錄」試算表。",
+          Bot.Menu.main_menu_kb()
+        )
 
       other ->
-        raise "Google token 端點錯誤: #{other.status} #{inspect(other.body)}"
+        Logger.error("交換授權碼失敗: #{other.status} #{inspect(other.body)}")
+
+        Bot.Telegram.send_message(
+          chat_id,
+          "❌ Google 帳號連結失敗，請稍後再試一次。"
+        )
     end
   end
 
-  def build_jwt(sa) do
-    jwk = JOSE.JWK.from_pem(sa.private_key)
-    iat = System.os_time(:second)
+  # 只需讀到第一個請求行 (GET /?code=...&state=... HTTP/1.1) 即可取得查詢參數。
+  defp read_query(sock, acc \\ "") do
+    if String.contains?(acc, "\r\n") do
+      parse_query(acc)
+    else
+      case :gen_tcp.recv(sock, 0, 5000) do
+        {:ok, data} -> read_query(sock, acc <> data)
+        {:error, _} -> parse_query(acc)
+      end
+    end
+  end
 
-    claims = %{
-      "iss" => sa.client_email,
-      "scope" => "https://www.googleapis.com/auth/spreadsheets",
-      "aud" => sa.token_uri,
-      "iat" => iat,
-      "exp" => iat + 3600
-    }
+  defp parse_query(raw) do
+    with [req_line | _] <- String.split(raw, "\r\n"),
+         [_method, target | _] <- String.split(req_line, " "),
+         %URI{query: q} when is_binary(q) <- URI.parse(target) do
+      URI.decode_query(q)
+    else
+      _ -> %{}
+    end
+  end
 
-    {_, jwt} =
-      JOSE.JWT.sign(jwk, %{"alg" => "RS256"}, claims)
-      |> JOSE.JWS.compact()
+  defp respond(sock, message) do
+    html = """
+    <!doctype html><html lang="zh-Hant"><head><meta charset="utf-8">
+    <title>血壓追蹤機器人</title></head>
+    <body style="font-family:sans-serif;text-align:center;padding:3em">
+    <h2>#{message}</h2></body></html>
+    """
 
-    jwt
+    :gen_tcp.send(
+      sock,
+      "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n" <>
+        "Content-Length: #{byte_size(html)}\r\nConnection: close\r\n\r\n" <> html
+    )
+
+    :gen_tcp.close(sock)
   end
 end
 
 defmodule Bot.Sheets do
-  @moduledoc "新增血壓紀錄列、讀取最近 N 列。使用 Bot.Auth.token/0 作為 bearer。"
+  @moduledoc "在使用者自己的 Drive 建立 / 讀寫私人試算表。使用該使用者的 access token。"
 
-  # 工作表(分頁)名稱與範圍。若你的分頁不叫 "Sheet1"，請改這裡。
   @sheet_name "Sheet1"
+  @headers ["日期時間", "收縮壓", "舒張壓", "脈搏", "Telegram使用者", "備註"]
 
-  def append(systolic, diastolic, pulse, user) do
-    suffix =
-      "/values/" <>
-        URI.encode(@sheet_name <> "!A:F") <> ":append?valueInputOption=USER_ENTERED"
+  # 取得使用者試算表 ID，沒有就在其 Drive 建立一份。
+  def ensure_spreadsheet(chat_id) do
+    case Bot.Users.get(chat_id) do
+      %{"spreadsheet_id" => id} when is_binary(id) ->
+        {:ok, id}
+
+      _ ->
+        create_spreadsheet(chat_id)
+    end
+  end
+
+  defp create_spreadsheet(chat_id) do
+    {:ok, at} = Bot.OAuth.access_token(chat_id)
 
     resp =
-      Req.post!(url(suffix),
-        headers: auth_header(),
-        json: %{values: [[timestamp_taipei(), systolic, diastolic, pulse, user, ""]]}
+      Req.post!("https://sheets.googleapis.com/v4/spreadsheets",
+        headers: bearer(at),
+        json: %{
+          properties: %{title: "血壓紀錄"},
+          sheets: [%{properties: %{title: @sheet_name}}]
+        }
       )
 
-    if resp.status not in 200..299 do
-      raise "Sheets 寫入失敗: #{resp.status} #{inspect(resp.body)}"
-    end
+    case resp do
+      %{status: 200, body: %{"spreadsheetId" => id}} ->
+        Bot.Users.put(chat_id, %{"spreadsheet_id" => id})
+        append_row(id, at, @headers)
+        {:ok, id}
 
+      other ->
+        raise "建立試算表失敗: #{other.status} #{inspect(other.body)}"
+    end
+  end
+
+  def append(chat_id, systolic, diastolic, pulse, user) do
+    {:ok, at} = Bot.OAuth.access_token(chat_id)
+    {:ok, id} = ensure_spreadsheet(chat_id)
+    append_row(id, at, [timestamp_taipei(), systolic, diastolic, pulse, user, ""])
     :ok
   end
 
-  def recent(n \\ 10) do
+  def recent(chat_id, n \\ 10) do
+    {:ok, at} = Bot.OAuth.access_token(chat_id)
+    {:ok, id} = ensure_spreadsheet(chat_id)
     suffix = "/values/" <> URI.encode(@sheet_name <> "!A2:F")
-
-    resp = Req.get!(url(suffix), headers: auth_header())
+    resp = Req.get!(values_url(id, suffix), headers: bearer(at))
 
     case resp do
       %{status: 200, body: body} ->
@@ -162,8 +392,26 @@ defmodule Bot.Sheets do
         end
 
       other ->
-        raise "Sheets 讀取失敗: #{other.status} #{inspect(other.body)}"
+        raise "讀取紀錄失敗: #{other.status} #{inspect(other.body)}"
     end
+  end
+
+  defp append_row(spreadsheet_id, access_token, row) do
+    suffix =
+      "/values/" <>
+        URI.encode(@sheet_name <> "!A:F") <> ":append?valueInputOption=USER_ENTERED"
+
+    resp =
+      Req.post!(values_url(spreadsheet_id, suffix),
+        headers: bearer(access_token),
+        json: %{values: [row]}
+      )
+
+    if resp.status not in 200..299 do
+      raise "寫入試算表失敗: #{resp.status} #{inspect(resp.body)}"
+    end
+
+    :ok
   end
 
   # 固定 UTC+8 (台灣無日光節約)，避免依賴 tz 資料庫。
@@ -173,10 +421,10 @@ defmodule Bot.Sheets do
     |> Calendar.strftime("%Y-%m-%d %H:%M:%S")
   end
 
-  def auth_header, do: [{"authorization", "Bearer " <> Bot.Auth.token()}]
+  defp bearer(at), do: [{"authorization", "Bearer " <> at}]
 
-  def url(suffix),
-    do: "https://sheets.googleapis.com/v4/spreadsheets/" <> Bot.Config.sheet_id() <> suffix
+  defp values_url(id, suffix),
+    do: "https://sheets.googleapis.com/v4/spreadsheets/" <> id <> suffix
 end
 
 defmodule Bot.Telegram do
@@ -229,6 +477,20 @@ defmodule Bot.Menu do
     ]
   end
 
+  # 尚未連結 Google 帳號時顯示的提示與授權按鈕 (URL 按鈕)。
+  def connect_text,
+    do:
+      "🔗 請先連結您的 Google 帳號\n\n" <>
+        "機器人會在「您自己的」Google 雲端硬碟建立一份私人試算表來儲存血壓紀錄。\n" <>
+        "點下方按鈕完成授權後，再回來操作。"
+
+  def connect_kb(auth_url) do
+    [
+      [%{text: "🔗 連結 Google 帳號", url: auth_url}],
+      [%{text: "🏠 返回主選單", callback_data: "main_menu"}]
+    ]
+  end
+
   def keypad_kb do
     [
       [
@@ -275,13 +537,13 @@ defmodule Bot.Menu do
     📝 功能說明：
 
     1️⃣ 記錄血壓
-       輸入收縮壓、舒張壓和脈搏數據，自動保存到個人紀錄。
+       輸入收縮壓、舒張壓和脈搏數據，儲存到您自己 Google 雲端硬碟的私人試算表。
 
     2️⃣ 查看最近紀錄
        檢視過去的血壓測量數據，追蹤健康趨勢。
 
-    3️⃣ 設定
-       調整個人偏好設定。
+    🔐 隱私
+       資料存於「您自己的」Google Drive，僅您本人可存取。
 
     📊 血壓參考範圍：
     正常: 收縮壓 < 120 且 舒張壓 < 80
@@ -290,8 +552,6 @@ defmodule Bot.Menu do
     第二階段高血壓: 收縮壓 ≥ 140 或 舒張壓 ≥ 90
 
     ⏰ 所有時間使用台灣時區 (UTC+8)
-
-    💡 貼示：定期測量血壓有助於監測健康。
     """
   end
 
@@ -352,7 +612,7 @@ defmodule Bot.Menu do
 end
 
 defmodule Bot.State do
-  @moduledoc "每位使用者的對話狀態，存於以 chat_id 為鍵的 Agent。"
+  @moduledoc "每位使用者的對話狀態 (鍵盤輸入流程)，存於以 chat_id 為鍵的 Agent。"
 
   def start_link, do: Agent.start_link(fn -> %{} end, name: __MODULE__)
 
@@ -364,11 +624,11 @@ defmodule Bot.State do
 end
 
 defmodule Bot do
-  @moduledoc "啟動 Agents、執行長輪詢迴圈、派發更新、實作資料輸入狀態機。"
+  @moduledoc "啟動 Agents/伺服器、執行長輪詢迴圈、派發更新、實作資料輸入狀態機。"
 
   require Logger
 
-  alias Bot.{Telegram, Menu, State, Sheets}
+  alias Bot.{Telegram, Menu, State, Sheets, Users, OAuth}
 
   @ranges %{
     systolic: {60, 260},
@@ -377,8 +637,9 @@ defmodule Bot do
   }
 
   def start do
-    Bot.State.start_link()
-    Bot.Auth.start_link()
+    State.start_link()
+    Users.start_link()
+    OAuth.start_link()
     Logger.info("血壓追蹤機器人已啟動，開始長輪詢...")
     poll_loop(0)
   end
@@ -412,7 +673,7 @@ defmodule Bot do
     (updates |> Enum.map(& &1["update_id"]) |> Enum.max()) + 1
   end
 
-  # 任何文字訊息 (含 /start) -> 重置並送出主選單 (新訊息，因無前一個鍵盤訊息可編輯)
+  # 任何文字訊息 (含 /start) -> 重置並送出主選單。
   def handle(%{"message" => msg}) do
     chat_id = msg["chat"]["id"]
     State.reset(chat_id)
@@ -438,16 +699,28 @@ defmodule Bot do
 
   def handle(_other), do: :ok
 
+  # 需要 Google 連結的功能，先確認已連結，否則顯示授權連結。
   def route_callback("record_bp", chat_id, message_id, _user) do
-    State.put(chat_id, %{
-      step: :systolic,
-      message_id: message_id,
-      systolic: "",
-      diastolic: "",
-      pulse: ""
-    })
+    require_connected(chat_id, message_id, fn ->
+      State.put(chat_id, %{
+        step: :systolic,
+        message_id: message_id,
+        systolic: "",
+        diastolic: "",
+        pulse: ""
+      })
 
-    edit(chat_id, message_id, Menu.prompt_text(:systolic, ""), Menu.keypad_kb())
+      edit(chat_id, message_id, Menu.prompt_text(:systolic, ""), Menu.keypad_kb())
+    end)
+  end
+
+  def route_callback("view_recent", chat_id, message_id, _user) do
+    require_connected(chat_id, message_id, fn ->
+      State.reset(chat_id)
+      rows = Sheets.recent(chat_id, 10)
+      kb = if rows == [], do: Menu.no_records_kb(), else: Menu.records_kb()
+      edit(chat_id, message_id, Menu.records_text(rows), kb)
+    end)
   end
 
   def route_callback("main_menu", chat_id, message_id, _user) do
@@ -463,13 +736,6 @@ defmodule Bot do
   def route_callback("settings", chat_id, message_id, _user) do
     State.reset(chat_id)
     edit(chat_id, message_id, Menu.settings_text(), Menu.back_kb())
-  end
-
-  def route_callback("view_recent", chat_id, message_id, _user) do
-    State.reset(chat_id)
-    rows = Sheets.recent(10)
-    kb = if rows == [], do: Menu.no_records_kb(), else: Menu.records_kb()
-    edit(chat_id, message_id, Menu.records_text(rows), kb)
   end
 
   def route_callback("d:" <> digit, chat_id, _message_id, _user) do
@@ -501,7 +767,18 @@ defmodule Bot do
 
   def route_callback(_unknown, _chat_id, _message_id, _user), do: :ok
 
-  # 僅在有進行中的對話時執行 keypad 動作 (d:/del/ok)
+  # 未連結 Google 帳號時，顯示授權連結；已連結則執行 fun。
+  defp require_connected(chat_id, message_id, fun) do
+    if Users.connected?(chat_id) do
+      fun.()
+    else
+      State.reset(chat_id)
+      url = OAuth.auth_url(chat_id)
+      edit(chat_id, message_id, Menu.connect_text(), Menu.connect_kb(url))
+    end
+  end
+
+  # 僅在有進行中的對話時執行 keypad 動作 (d:/del/ok)。
   defp with_state(chat_id, fun) do
     case State.get(chat_id) do
       nil -> :ok
@@ -540,7 +817,7 @@ defmodule Bot do
     dia = String.to_integer(state.diastolic)
     pul = String.to_integer(state.pulse)
 
-    Sheets.append(sys, dia, pul, user)
+    Sheets.append(chat_id, sys, dia, pul, user)
     ts = Sheets.timestamp_taipei()
 
     edit(chat_id, state.message_id, Menu.confirm_text(sys, dia, pul, ts), Menu.confirmed_kb())
