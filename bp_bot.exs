@@ -1,3 +1,5 @@
+#!/usr/bin/env elixir
+
 Mix.install([{:req, "~> 0.5"}, {:jason, "~> 1.4"}])
 
 # =============================================================================
@@ -254,7 +256,7 @@ defmodule Bot.OAuth do
     e -> Logger.error("OAuth callback 處理失敗: #{inspect(e)}")
   end
 
-  defp finish_auth(chat_id, code) do
+  def finish_auth(chat_id, code) do
     c = Bot.Config.oauth_client()
 
     resp =
@@ -437,22 +439,21 @@ defmodule Bot.Telegram do
     ).body["result"]
   end
 
-  def send_message(chat_id, text, keyboard \\ nil) do
-    Req.post!(Bot.Config.api_base() <> "/sendMessage",
-      json: with_markup(%{chat_id: chat_id, text: text}, keyboard)
-    ).body["result"]
-  end
-
-  def edit_message_text(chat_id, message_id, text, keyboard \\ nil) do
-    Req.post!(Bot.Config.api_base() <> "/editMessageText",
-      json: with_markup(%{chat_id: chat_id, message_id: message_id, text: text}, keyboard)
-    )
+  # opts 可帶 parse_mode 等額外欄位 (例如 %{parse_mode: "HTML"})。
+  def send_message(chat_id, text, keyboard \\ nil, opts \\ %{}) do
+    body = %{chat_id: chat_id, text: text} |> Map.merge(opts) |> with_markup(keyboard)
+    Req.post!(Bot.Config.api_base() <> "/sendMessage", json: body).body["result"]
   end
 
   def answer_callback(callback_query_id) do
     Req.post!(Bot.Config.api_base() <> "/answerCallbackQuery",
       json: %{callback_query_id: callback_query_id}
     )
+  end
+
+  # 註冊指令選單 (Telegram 客戶端會在輸入框旁顯示)。
+  def set_my_commands(commands) do
+    Req.post!(Bot.Config.api_base() <> "/setMyCommands", json: %{commands: commands})
   end
 
   def with_markup(body, nil), do: body
@@ -462,7 +463,17 @@ end
 defmodule Bot.Menu do
   @moduledoc "所有繁體中文文案與 InlineKeyboardMarkup 版面。純函式。"
 
-  def main_menu_text, do: "👋 歡迎使用血壓追蹤機器人\n\n請選擇功能"
+  # 向 Telegram 註冊的指令選單。
+  def commands do
+    [
+      %{command: "start", description: "開始 / 主選單"},
+      %{command: "record", description: "記錄血壓"},
+      %{command: "list", description: "查看最近紀錄"},
+      %{command: "help", description: "使用說明"}
+    ]
+  end
+
+  def main_menu_text, do: "👋 歡迎使用血壓追蹤機器人\n\n請選擇功能，或輸入指令 /record、/list"
 
   def main_menu_kb do
     [
@@ -470,19 +481,21 @@ defmodule Bot.Menu do
         %{text: "📝 記錄血壓", callback_data: "record_bp"},
         %{text: "📊 查看最近紀錄", callback_data: "view_recent"}
       ],
-      [
-        %{text: "ℹ️ 說明", callback_data: "help"},
-        %{text: "⚙️ 設定", callback_data: "settings"}
-      ]
+      [%{text: "ℹ️ 說明", callback_data: "help"}]
     ]
   end
 
   # 尚未連結 Google 帳號時顯示的提示與授權按鈕 (URL 按鈕)。
-  def connect_text,
-    do:
-      "🔗 請先連結您的 Google 帳號\n\n" <>
-        "機器人會在「您自己的」Google 雲端硬碟建立一份私人試算表來儲存血壓紀錄。\n" <>
-        "點下方按鈕完成授權後，再回來操作。"
+  def connect_text do
+    """
+    🔗 歡迎！請先連結您的 Google 帳號
+
+    機器人會在「您自己的」Google 雲端硬碟建立一份私人試算表來儲存血壓紀錄，僅您本人可存取。
+
+    1️⃣ 點下方按鈕，登入並允許授權。
+    2️⃣ 授權後若瀏覽器顯示「無法連線 localhost」屬正常 — 請把瀏覽器網址列的「整段網址」複製後貼回本對話，即可完成連結。
+    """
+  end
 
   def connect_kb(auth_url) do
     [
@@ -491,56 +504,22 @@ defmodule Bot.Menu do
     ]
   end
 
-  def keypad_kb do
-    [
-      [
-        %{text: "1", callback_data: "d:1"},
-        %{text: "2", callback_data: "d:2"},
-        %{text: "3", callback_data: "d:3"}
-      ],
-      [
-        %{text: "4", callback_data: "d:4"},
-        %{text: "5", callback_data: "d:5"},
-        %{text: "6", callback_data: "d:6"}
-      ],
-      [
-        %{text: "7", callback_data: "d:7"},
-        %{text: "8", callback_data: "d:8"},
-        %{text: "9", callback_data: "d:9"}
-      ],
-      [
-        %{text: "0", callback_data: "d:0"},
-        %{text: "⌫ 刪除", callback_data: "del"},
-        %{text: "✅ 確認", callback_data: "ok"}
-      ]
-    ]
-  end
-
-  def prompt_text(:systolic, current),
-    do: "📋 請輸入收縮壓 (mmHg)\n當前值: " <> display(current)
-
-  def prompt_text(:diastolic, current),
-    do: "📋 請輸入舒張壓 (mmHg)\n當前值: " <> display(current)
-
-  def prompt_text(:pulse, current),
-    do: "📋 請輸入脈搏 (bpm)\n當前值: " <> display(current)
-
-  defp display(""), do: "—"
-  defp display(v), do: v
+  # 直接讓使用者輸入數字 (內嵌數字鍵盤每次點擊都需往返伺服器，反應太慢)。
+  # 註: Telegram Bot API 無法為一般文字訊息強制叫出數字鍵盤 (僅 Web App 支援)，
+  # 故僅以提示請使用者輸入數字。
+  def prompt_text(:systolic), do: "📋 請輸入收縮壓 (mmHg)\n直接輸入數字即可，例如 120"
+  def prompt_text(:diastolic), do: "📋 請輸入舒張壓 (mmHg)\n直接輸入數字即可，例如 80"
+  def prompt_text(:pulse), do: "📋 請輸入脈搏 (bpm)\n直接輸入數字即可，例如 72"
 
   def help_text do
     """
     ℹ️ 使用說明
 
-    歡迎使用血壓追蹤機器人！
+    📝 /record 記錄血壓
+       依序輸入收縮壓、舒張壓、脈搏 (直接打數字)，儲存到您自己 Google 雲端硬碟的私人試算表。
 
-    📝 功能說明：
-
-    1️⃣ 記錄血壓
-       輸入收縮壓、舒張壓和脈搏數據，儲存到您自己 Google 雲端硬碟的私人試算表。
-
-    2️⃣ 查看最近紀錄
-       檢視過去的血壓測量數據，追蹤健康趨勢。
+    📊 /list 查看最近紀錄
+       以表格檢視最近的血壓數據。
 
     🔐 隱私
        資料存於「您自己的」Google Drive，僅您本人可存取。
@@ -555,29 +534,7 @@ defmodule Bot.Menu do
     """
   end
 
-  def settings_text, do: "⚙️ 設定\n\n目前沒有可調整的設定。"
-
   def back_kb, do: [[%{text: "🏠 返回主選單", callback_data: "main_menu"}]]
-
-  def confirmed_kb, do: [[%{text: "🏠 返回主選單", callback_data: "main_menu"}]]
-
-  def records_kb do
-    [
-      [
-        %{text: "🏠 返回主選單", callback_data: "main_menu"},
-        %{text: "➕ 新增記錄", callback_data: "record_bp"}
-      ]
-    ]
-  end
-
-  def no_records_kb do
-    [
-      [
-        %{text: "📝 開始記錄", callback_data: "record_bp"},
-        %{text: "🏠 返回主選單", callback_data: "main_menu"}
-      ]
-    ]
-  end
 
   def confirm_text(systolic, diastolic, pulse, ts) do
     "✅ 血壓紀錄已保存\n\n📊 記錄詳情\n收縮壓: #{systolic} mmHg\n舒張壓: #{diastolic} mmHg\n脈搏: #{pulse} bpm\n\n⏰ 記錄時間: #{ts}"
@@ -585,28 +542,35 @@ defmodule Bot.Menu do
 
   def records_text([]), do: "📊 目前沒有血壓紀錄。"
 
+  # 以等寬 <pre> 區塊呈現緊湊表格 (數字欄右對齊)。
   def records_text(rows) do
-    header = "📊 最近的血壓紀錄\n"
+    head = "日期/時間     收縮 舒張 脈搏"
+    sep = String.duplicate("-", 26)
 
     body =
-      rows
-      |> Enum.with_index(1)
-      |> Enum.map_join("\n", fn {row, i} ->
+      Enum.map_join(rows, "\n", fn row ->
         [ts, sys, dia, pul | _] = row ++ List.duplicate("", 4)
-        "\n##{i} | #{ts}\n   收縮壓: #{sys} | 舒張壓: #{dia} | 脈搏: #{pul}"
+        date = ts |> to_string() |> String.slice(5, 11) |> String.pad_trailing(11)
+        "#{date} #{col(sys)} #{col(dia)} #{col(pul)}"
       end)
 
-    header <> body
+    "📊 最近血壓紀錄\n<pre>" <> esc("#{head}\n#{sep}\n#{body}") <> "</pre>"
   end
 
-  # field in [:systolic, :diastolic, :pulse]; kind in [:blank, :low, :high]
-  def error_text(:systolic, :blank), do: "❌ 請輸入收縮壓值。"
+  defp col(v), do: v |> to_string() |> String.pad_leading(4)
+
+  defp esc(s) do
+    s
+    |> String.replace("&", "&amp;")
+    |> String.replace("<", "&lt;")
+    |> String.replace(">", "&gt;")
+  end
+
+  # field in [:systolic, :diastolic, :pulse]; kind in [:low, :high]
   def error_text(:systolic, :low), do: "❌ 收縮壓過低。正常範圍為 60-260 mmHg。"
   def error_text(:systolic, :high), do: "❌ 收縮壓過高。正常範圍為 60-260 mmHg。"
-  def error_text(:diastolic, :blank), do: "❌ 請輸入舒張壓值。"
   def error_text(:diastolic, :low), do: "❌ 舒張壓過低。正常範圍為 40-160 mmHg。"
   def error_text(:diastolic, :high), do: "❌ 舒張壓過高。正常範圍為 40-160 mmHg。"
-  def error_text(:pulse, :blank), do: "❌ 請輸入脈搏值。"
   def error_text(:pulse, :low), do: "❌ 脈搏過低。正常範圍為 30-220 bpm。"
   def error_text(:pulse, :high), do: "❌ 脈搏過高。正常範圍為 30-220 bpm。"
 end
@@ -624,7 +588,7 @@ defmodule Bot.State do
 end
 
 defmodule Bot do
-  @moduledoc "啟動 Agents/伺服器、執行長輪詢迴圈、派發更新、實作資料輸入狀態機。"
+  @moduledoc "啟動 Agents/伺服器、執行長輪詢迴圈、派發更新、實作文字輸入狀態機。"
 
   require Logger
 
@@ -640,6 +604,7 @@ defmodule Bot do
     State.start_link()
     Users.start_link()
     OAuth.start_link()
+    Telegram.set_my_commands(Menu.commands())
     Logger.info("血壓追蹤機器人已啟動，開始長輪詢...")
     poll_loop(0)
   end
@@ -673,11 +638,19 @@ defmodule Bot do
     (updates |> Enum.map(& &1["update_id"]) |> Enum.max()) + 1
   end
 
-  # 任何文字訊息 (含 /start) -> 重置並送出主選單。
+  # ----- 派發 -----
+
   def handle(%{"message" => msg}) do
     chat_id = msg["chat"]["id"]
-    State.reset(chat_id)
-    Telegram.send_message(chat_id, Menu.main_menu_text(), Menu.main_menu_kb())
+    user = msg["from"]["username"] || to_string(msg["from"]["id"])
+    text = String.trim(msg["text"] || "")
+
+    cond do
+      oauth_paste?(text) -> complete_paste(chat_id, text)
+      command?(text) -> run_command(command_name(text), chat_id)
+      recording?(chat_id) -> input_number(chat_id, text, user)
+      true -> show_home(chat_id)
+    end
   end
 
   def handle(%{"callback_query" => cq}) do
@@ -686,163 +659,134 @@ defmodule Bot do
 
     # 訊息過舊時 Telegram 會省略 message 欄位，需防呆避免崩潰。
     case cq["message"] do
-      nil ->
-        :ok
-
-      msg ->
-        chat_id = msg["chat"]["id"]
-        message_id = msg["message_id"]
-        user = cq["from"]["username"] || to_string(cq["from"]["id"])
-        route_callback(cq["data"], chat_id, message_id, user)
+      nil -> :ok
+      msg -> route(cq["data"], msg["chat"]["id"])
     end
   end
 
   def handle(_other), do: :ok
 
-  # 需要 Google 連結的功能，先確認已連結，否則顯示授權連結。
-  def route_callback("record_bp", chat_id, message_id, _user) do
-    require_connected(chat_id, message_id, fn ->
-      State.put(chat_id, %{
-        step: :systolic,
-        message_id: message_id,
-        systolic: "",
-        diastolic: "",
-        pulse: ""
-      })
+  # 內嵌按鈕回呼
+  defp route("record_bp", chat_id), do: start_record(chat_id)
+  defp route("view_recent", chat_id), do: list_records(chat_id)
+  defp route("help", chat_id), do: Telegram.send_message(chat_id, Menu.help_text(), Menu.back_kb())
+  defp route("main_menu", chat_id), do: show_home(chat_id)
+  defp route(_unknown, _chat_id), do: :ok
 
-      edit(chat_id, message_id, Menu.prompt_text(:systolic, ""), Menu.keypad_kb())
-    end)
+  # 指令
+  defp command?(text), do: String.starts_with?(text, "/")
+
+  defp command_name(text) do
+    text |> String.split() |> hd() |> String.trim_leading("/") |> String.split("@") |> hd()
   end
 
-  def route_callback("view_recent", chat_id, message_id, _user) do
-    require_connected(chat_id, message_id, fn ->
+  defp run_command("record", chat_id), do: start_record(chat_id)
+  defp run_command("list", chat_id), do: list_records(chat_id)
+  defp run_command("help", chat_id), do: Telegram.send_message(chat_id, Menu.help_text(), Menu.back_kb())
+  # /start、/menu 與未知指令 -> 首頁 (新使用者會先引導連結 Google)
+  defp run_command(_other, chat_id), do: show_home(chat_id)
+
+  # 首頁：已連結顯示主選單；新使用者引導 OAuth 連結。
+  defp show_home(chat_id) do
+    State.reset(chat_id)
+
+    if Users.connected?(chat_id) do
+      Telegram.send_message(chat_id, Menu.main_menu_text(), Menu.main_menu_kb())
+    else
+      onboard(chat_id)
+    end
+  end
+
+  defp onboard(chat_id) do
+    url = OAuth.auth_url(chat_id)
+    Telegram.send_message(chat_id, Menu.connect_text(), Menu.connect_kb(url))
+  end
+
+  # ----- 記錄流程 (文字輸入) -----
+
+  defp start_record(chat_id) do
+    if Users.connected?(chat_id) do
+      State.put(chat_id, %{step: :systolic, systolic: nil, diastolic: nil})
+      Telegram.send_message(chat_id, Menu.prompt_text(:systolic))
+    else
+      onboard(chat_id)
+    end
+  end
+
+  defp list_records(chat_id) do
+    if Users.connected?(chat_id) do
       State.reset(chat_id)
       rows = Sheets.recent(chat_id, 10)
-      kb = if rows == [], do: Menu.no_records_kb(), else: Menu.records_kb()
-      edit(chat_id, message_id, Menu.records_text(rows), kb)
-    end)
-  end
-
-  def route_callback("main_menu", chat_id, message_id, _user) do
-    State.reset(chat_id)
-    edit(chat_id, message_id, Menu.main_menu_text(), Menu.main_menu_kb())
-  end
-
-  def route_callback("help", chat_id, message_id, _user) do
-    State.reset(chat_id)
-    edit(chat_id, message_id, Menu.help_text(), Menu.back_kb())
-  end
-
-  def route_callback("settings", chat_id, message_id, _user) do
-    State.reset(chat_id)
-    edit(chat_id, message_id, Menu.settings_text(), Menu.back_kb())
-  end
-
-  def route_callback("d:" <> digit, chat_id, _message_id, _user) do
-    with_state(chat_id, fn state ->
-      current = Map.fetch!(state, state.step)
-
-      new_val =
-        if String.length(current) >= 3, do: current, else: current <> digit
-
-      state = Map.put(state, state.step, new_val)
-      State.put(chat_id, state)
-      edit(chat_id, state.message_id, Menu.prompt_text(state.step, new_val), Menu.keypad_kb())
-    end)
-  end
-
-  def route_callback("del", chat_id, _message_id, _user) do
-    with_state(chat_id, fn state ->
-      current = Map.fetch!(state, state.step)
-      new_val = String.slice(current, 0..-2//1)
-      state = Map.put(state, state.step, new_val)
-      State.put(chat_id, state)
-      edit(chat_id, state.message_id, Menu.prompt_text(state.step, new_val), Menu.keypad_kb())
-    end)
-  end
-
-  def route_callback("ok", chat_id, _message_id, user) do
-    with_state(chat_id, fn state -> on_confirm(state, chat_id, user) end)
-  end
-
-  def route_callback(_unknown, _chat_id, _message_id, _user), do: :ok
-
-  # 未連結 Google 帳號時，顯示授權連結；已連結則執行 fun。
-  defp require_connected(chat_id, message_id, fun) do
-    if Users.connected?(chat_id) do
-      fun.()
+      Telegram.send_message(chat_id, Menu.records_text(rows), Menu.main_menu_kb(), %{parse_mode: "HTML"})
     else
-      State.reset(chat_id)
-      url = OAuth.auth_url(chat_id)
-      edit(chat_id, message_id, Menu.connect_text(), Menu.connect_kb(url))
+      onboard(chat_id)
     end
   end
 
-  # 僅在有進行中的對話時執行 keypad 動作 (d:/del/ok)。
-  defp with_state(chat_id, fun) do
-    case State.get(chat_id) do
-      nil -> :ok
-      state -> fun.(state)
+  defp recording?(chat_id), do: State.get(chat_id) != nil
+
+  defp input_number(chat_id, text, user) do
+    state = State.get(chat_id)
+
+    case Integer.parse(text) do
+      {n, ""} -> validated(chat_id, state, n, user)
+      _ -> Telegram.send_message(chat_id, "❌ 請輸入有效的數字。\n" <> Menu.prompt_text(state.step))
     end
   end
 
-  def on_confirm(state, chat_id, user) do
+  defp validated(chat_id, state, n, user) do
     field = state.step
-    value = Map.fetch!(state, field)
-
-    case validate(field, value) do
-      {:error, kind} ->
-        text = Menu.error_text(field, kind) <> "\n\n" <> Menu.prompt_text(field, value)
-        edit(chat_id, state.message_id, text, Menu.keypad_kb())
-
-      {:ok, _int} ->
-        advance(state, chat_id, user)
-    end
-  end
-
-  defp advance(%{step: :systolic} = state, chat_id, _user) do
-    state = %{state | step: :diastolic}
-    State.put(chat_id, state)
-    edit(chat_id, state.message_id, Menu.prompt_text(:diastolic, ""), Menu.keypad_kb())
-  end
-
-  defp advance(%{step: :diastolic} = state, chat_id, _user) do
-    state = %{state | step: :pulse}
-    State.put(chat_id, state)
-    edit(chat_id, state.message_id, Menu.prompt_text(:pulse, ""), Menu.keypad_kb())
-  end
-
-  defp advance(%{step: :pulse} = state, chat_id, user) do
-    sys = String.to_integer(state.systolic)
-    dia = String.to_integer(state.diastolic)
-    pul = String.to_integer(state.pulse)
-
-    Sheets.append(chat_id, sys, dia, pul, user)
-    ts = Sheets.timestamp_taipei()
-
-    edit(chat_id, state.message_id, Menu.confirm_text(sys, dia, pul, ts), Menu.confirmed_kb())
-    State.reset(chat_id)
-  end
-
-  defp validate(field, value) do
     {lo, hi} = @ranges[field]
 
     cond do
-      value == "" -> {:error, :blank}
-      true -> check_range(String.to_integer(value), lo, hi)
+      n < lo -> Telegram.send_message(chat_id, Menu.error_text(field, :low) <> "\n" <> Menu.prompt_text(field))
+      n > hi -> Telegram.send_message(chat_id, Menu.error_text(field, :high) <> "\n" <> Menu.prompt_text(field))
+      true -> advance(chat_id, state, n, user)
     end
   end
 
-  defp check_range(int, lo, _hi) when int < lo, do: {:error, :low}
-  defp check_range(int, _lo, hi) when int > hi, do: {:error, :high}
-  defp check_range(int, _lo, _hi), do: {:ok, int}
+  defp advance(chat_id, %{step: :systolic} = state, n, _user) do
+    State.put(chat_id, %{state | step: :diastolic, systolic: n})
+    Telegram.send_message(chat_id, Menu.prompt_text(:diastolic))
+  end
 
-  # editMessageText 在新內容與舊內容完全相同時會回 400 "message is not modified"
-  # (例如對已空欄位按刪除)。在此捕捉該情況使其成為 no-op。
-  defp edit(chat_id, message_id, text, keyboard) do
-    Telegram.edit_message_text(chat_id, message_id, text, keyboard)
-  rescue
-    e -> Logger.debug("editMessageText 略過 (可能未變更): #{inspect(e)}")
+  defp advance(chat_id, %{step: :diastolic} = state, n, _user) do
+    State.put(chat_id, %{state | step: :pulse, diastolic: n})
+    Telegram.send_message(chat_id, Menu.prompt_text(:pulse))
+  end
+
+  defp advance(chat_id, %{step: :pulse} = state, n, user) do
+    Sheets.append(chat_id, state.systolic, state.diastolic, n, user)
+    ts = Sheets.timestamp_taipei()
+    State.reset(chat_id)
+    Telegram.send_message(chat_id, Menu.confirm_text(state.systolic, state.diastolic, n, ts), Menu.main_menu_kb())
+  end
+
+  # ----- OAuth 貼上回呼網址 (非同機使用者的後備方案) -----
+
+  defp oauth_paste?(text), do: String.contains?(text, "code=")
+
+  defp complete_paste(chat_id, text) do
+    params = parse_query(text)
+
+    case params["code"] do
+      nil ->
+        Telegram.send_message(chat_id, "❌ 無法辨識授權資訊，請貼上完整的網址。")
+
+      code ->
+        if s = params["state"], do: Agent.update(Bot.OAuth.Pending, &Map.delete(&1, s))
+        OAuth.finish_auth(chat_id, code)
+    end
+  end
+
+  defp parse_query(text) do
+    q =
+      case String.split(String.trim(text), "?", parts: 2) do
+        [_, rest] -> rest
+        [only] -> only
+      end
+
+    URI.decode_query(q)
   end
 end
 
